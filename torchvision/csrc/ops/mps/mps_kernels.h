@@ -199,6 +199,39 @@ inline bool IoU(
   return (inter / (area_a + area_b - inter)) > threshold;
 }
 
+template <typename T, typename integer_t>
+inline T get_coordinate_weight(
+    constant T* im_data,
+    integer_t height,
+    integer_t width,
+    T y,
+    T x,
+    bool is_y_direction) {
+  integer_t y_l = floor(y);
+  integer_t x_l = floor(x);
+  integer_t y_h = y_l + 1;
+  integer_t x_h = x_l + 1;
+
+  bool valid_y_l = 0 <= y_l && y_l < height;
+  bool valid_y_h = 0 <= y_h && y_h < height;
+  bool valid_x_l = 0 <= x_l && x_l < width;
+  bool valid_x_h = 0 <= x_h && x_h < width;
+
+  T zero = 0;
+  T v_yx = (valid_y_l && valid_x_l) ? im_data[y_l * width + x_l] : zero;
+  T v_yX = (valid_y_l && valid_x_h) ? im_data[y_l * width + x_h] : zero;
+  T v_Yx = (valid_y_h && valid_x_l) ? im_data[y_h * width + x_l] : zero;
+  T v_YX = (valid_y_h && valid_x_h) ? im_data[y_h * width + x_h] : zero;
+
+  if (is_y_direction) {
+    T dx = x - x_l;
+    return dx * (v_YX - v_yX) + (1 - dx) * (v_Yx - v_yx);
+  } else {
+    T dy = y - y_l;
+    return dy * (v_YX - v_Yx) + (1 - dy) * (v_yX - v_yx);
+  }
+}
+
 /*----------Kernels----------*/
 
 // This should be in sync with the one in nms_kernel.mm.
@@ -1036,11 +1069,374 @@ kernel void ps_roi_pool_backward<DTYPE, INT_DTYPE>(          \
     constant int64_t & width           [[buffer(7)]],        \
     constant int64_t & pooled_height   [[buffer(8)]],        \
     constant int64_t & pooled_width    [[buffer(9)]],        \
-    constant int64_t & channels_out    [[buffer(10)]],       \ 
+    constant int64_t & channels_out    [[buffer(10)]],       \
     constant float   & spatial_scale   [[buffer(11)]],       \
     uint2     tgid   [[threadgroup_position_in_grid]],       \
     uint2     tptg   [[threads_per_threadgroup]],            \
     uint2     tid2   [[thread_position_in_threadgroup]]);
+
+template <typename T, typename integer_t>
+kernel void deformable_im2col_kernel(
+    constant integer_t & n             [[buffer(0)]],
+    constant T         * input_ptr     [[buffer(1)]],
+    constant T         * offset_ptr    [[buffer(2)]],
+    constant T         * mask_ptr      [[buffer(3)]],
+    constant integer_t & height        [[buffer(4)]],
+    constant integer_t & width         [[buffer(5)]],
+    constant integer_t & weight_h      [[buffer(6)]],
+    constant integer_t & weight_w      [[buffer(7)]],
+    constant integer_t & pad_h         [[buffer(8)]],
+    constant integer_t & pad_w         [[buffer(9)]],
+    constant integer_t & stride_h      [[buffer(10)]],
+    constant integer_t & stride_w      [[buffer(11)]],
+    constant integer_t & dilation_h    [[buffer(12)]],
+    constant integer_t & dilation_w    [[buffer(13)]],
+    constant integer_t & batch_sz      [[buffer(14)]],
+    constant integer_t & n_in_channels [[buffer(15)]],
+    constant integer_t & n_offset_grps [[buffer(16)]],
+    constant integer_t & out_h         [[buffer(17)]],
+    constant integer_t & out_w         [[buffer(18)]],
+    constant bool      & use_mask      [[buffer(19)]],
+    device   T         * columns_ptr   [[buffer(20)]],
+    uint2     tgid   [[threadgroup_position_in_grid]],
+    uint2     tptg   [[threads_per_threadgroup]],
+    uint2     tid2   [[thread_position_in_threadgroup]]){
+  MPS_1D_KERNEL_LOOP_T(index, n, 1, integer_t) {
+    const integer_t out_x = index % out_w;
+    const integer_t out_y = (index / out_w) % out_h;
+    const integer_t out_b = (index / (out_w * out_h)) % batch_sz;
+    const integer_t in_c = index / (out_w * out_h * batch_sz);
+    const integer_t out_c = in_c * weight_h * weight_w;
+
+    integer_t c_per_offset_grp = n_in_channels / n_offset_grps;
+    const integer_t grp_idx = in_c / c_per_offset_grp;
+
+    columns_ptr +=
+        (out_c * (batch_sz * out_h * out_w) + out_b * (out_h * out_w) +
+        out_y * out_w + out_x);
+
+    input_ptr +=
+        (out_b * (n_in_channels * height * width) + in_c * (height * width));
+
+    offset_ptr += (out_b * n_offset_grps + grp_idx) * 2 * weight_h * weight_w *
+        out_h * out_w;
+
+    if (use_mask) {
+      mask_ptr += (out_b * n_offset_grps + grp_idx) * weight_h * weight_w *
+          out_h * out_w;
+    }
+
+    for (integer_t i = 0; i < weight_h; ++i) {
+      for (integer_t j = 0; j < weight_w; ++j) {
+        const integer_t mask_idx = i * weight_w + j;
+        const integer_t offset_idx = 2 * mask_idx;
+
+        T mask_value = 1;
+        if (use_mask) {
+          mask_value =
+              mask_ptr[mask_idx * (out_h * out_w) + out_y * out_w + out_x];
+        }
+
+        const T offset_h =
+            offset_ptr[offset_idx * (out_h * out_w) + out_y * out_w + out_x];
+        const T offset_w = offset_ptr
+            [(offset_idx + 1) * (out_h * out_w) + out_y * out_w + out_x];
+        const T y = static_cast<T>(
+            (out_y * stride_h - pad_h) + i * dilation_h + offset_h);
+        const T x = static_cast<T>(
+            (out_x * stride_w - pad_w) + j * dilation_w + offset_w);
+        *columns_ptr =
+            mask_value * bilinear_interpolate(input_ptr, height, width, y, x, index);
+        columns_ptr += batch_sz * out_h * out_w;
+      }
+    }
+  } // MPS_1D_KERNEL_LOOP_T
+}
+
+#define REGISTER_DEFORMABLE_IM2COL_OP(DTYPE, INT_DTYPE)     \
+template                                                    \
+[[host_name("deformable_im2col_" #DTYPE)]]                  \
+kernel void deformable_im2col_kernel<DTYPE, INT_DTYPE>(     \
+  constant INT_DTYPE & n             [[buffer(0)]],         \
+  constant DTYPE     * input_ptr     [[buffer(1)]],         \
+  constant DTYPE     * offset_ptr    [[buffer(2)]],         \
+  constant DTYPE     * mask_ptr      [[buffer(3)]],         \
+  constant INT_DTYPE & height        [[buffer(4)]],         \
+  constant INT_DTYPE & width         [[buffer(5)]],         \
+  constant INT_DTYPE & weight_h      [[buffer(6)]],         \
+  constant INT_DTYPE & weight_w      [[buffer(7)]],         \
+  constant INT_DTYPE & pad_h         [[buffer(8)]],         \
+  constant INT_DTYPE & pad_w         [[buffer(9)]],         \
+  constant INT_DTYPE & stride_h      [[buffer(10)]],        \
+  constant INT_DTYPE & stride_w      [[buffer(11)]],        \
+  constant INT_DTYPE & dilation_h    [[buffer(12)]],        \
+  constant INT_DTYPE & dilation_w    [[buffer(13)]],        \
+  constant INT_DTYPE & batch_sz      [[buffer(14)]],        \
+  constant INT_DTYPE & n_in_channels [[buffer(15)]],        \
+  constant INT_DTYPE & n_offset_grps [[buffer(16)]],        \
+  constant INT_DTYPE & out_h         [[buffer(17)]],        \
+  constant INT_DTYPE & out_w         [[buffer(18)]],        \
+  constant bool      & use_mask      [[buffer(19)]],        \
+  device   DTYPE     * columns_ptr   [[buffer(20)]],        \
+  uint2     tgid   [[threadgroup_position_in_grid]],        \
+  uint2     tptg   [[threads_per_threadgroup]],             \
+  uint2     tid2   [[thread_position_in_threadgroup]]);
+
+template <typename T, typename integer_t>
+kernel void deformable_col2im_kernel(
+    constant integer_t & n             [[buffer(0)]],
+    constant T         * col           [[buffer(1)]],
+    constant T         * offset_ptr    [[buffer(2)]],
+    constant T         * mask_ptr      [[buffer(3)]],
+    constant integer_t & channels      [[buffer(4)]],
+    constant integer_t & height        [[buffer(5)]],
+    constant integer_t & width         [[buffer(6)]],
+    constant integer_t & kernel_h      [[buffer(7)]],
+    constant integer_t & kernel_w      [[buffer(8)]],
+    constant integer_t & pad_h         [[buffer(9)]],
+    constant integer_t & pad_w         [[buffer(10)]],
+    constant integer_t & stride_h      [[buffer(11)]],
+    constant integer_t & stride_w      [[buffer(12)]],
+    constant integer_t & dilation_h    [[buffer(13)]],
+    constant integer_t & dilation_w    [[buffer(14)]],
+    constant integer_t & batch_sz      [[buffer(15)]],
+    constant integer_t & n_offset_grps [[buffer(16)]],
+    constant integer_t & out_h         [[buffer(17)]],
+    constant integer_t & out_w         [[buffer(18)]],
+    constant bool      & use_mask      [[buffer(19)]],
+    device   T         * grad_im       [[buffer(20)]],
+    uint2     tgid   [[threadgroup_position_in_grid]],
+    uint2     tptg   [[threads_per_threadgroup]],
+    uint2     tid2   [[thread_position_in_threadgroup]]){
+  const integer_t grad_im_numel = width * height * channels * batch_sz;
+
+  MPS_1D_KERNEL_LOOP_T(index, n, 1, integer_t) {
+    const integer_t out_x = index % out_w;
+    const integer_t out_y = (index / out_w) % out_h;
+    const integer_t b = (index / (out_w * out_h)) % batch_sz;
+    const integer_t j = (index / (out_w * out_h * batch_sz)) % kernel_w;
+    const integer_t i =
+        (index / (out_w * out_h * batch_sz * kernel_w)) % kernel_h;
+    const integer_t c = index / (out_w * out_h * batch_sz * kernel_w * kernel_h);
+
+    integer_t c_per_offset_grp = channels / n_offset_grps;
+    const integer_t offset_grp = c / c_per_offset_grp;
+
+    offset_ptr += (b * n_offset_grps + offset_grp) * 2 * kernel_h * kernel_w *
+        out_h * out_w;
+
+    if (use_mask) {
+      mask_ptr += (b * n_offset_grps + offset_grp) * kernel_h * kernel_w *
+          out_h * out_w;
+    }
+
+    const integer_t mask_idx = i * kernel_w + j;
+    const integer_t offset_idx = 2 * mask_idx;
+
+    const integer_t offset_h_ptr = ((offset_idx)*out_h + out_y) * out_w + out_x;
+    const integer_t offset_w_ptr =
+        ((offset_idx + 1) * out_h + out_y) * out_w + out_x;
+
+    const T offset_h = offset_ptr[offset_h_ptr];
+    const T offset_w = offset_ptr[offset_w_ptr];
+
+    T mask_value = 1;
+    if (use_mask) {
+      mask_value = mask_ptr[(mask_idx * out_h + out_y) * out_w + out_x];
+    }
+
+    const T y = (out_y * stride_h - pad_h) + i * dilation_h + offset_h;
+    const T x = (out_x * stride_w - pad_w) + j * dilation_w + offset_w;
+
+    for (integer_t dy = -1; dy <= 1; dy++) {
+      for (integer_t dx = -1; dx <= 1; dx++) {
+        integer_t yp = (integer_t)y + dy;
+        integer_t xp = (integer_t)x + dx;
+        if (0 <= yp && yp < height && 0 <= xp && xp < width &&
+            abs(y - yp) < 1 && abs(x - xp) < 1) {// include metal_math.h ??
+          integer_t grad_pos = ((b * channels + c) * height + yp) * width + xp;
+          T weight = (1 - abs(y - yp)) * (1 - abs(x - xp));// include metal_math.h ??
+          atomic_add_float(grad_im + grad_pos, mask_value * weight * col[index]);
+        }
+      }
+    }
+  } // MPS_1D_KERNEL_LOOP_T
+}
+
+#define REGISTER_DEFORMABLE_COL2IM_OP(DTYPE, INT_DTYPE)   \
+template                                                  \
+[[host_name("deformable_col2im_" #DTYPE)]]                \
+kernel void deformable_col2im_kernel<DTYPE, INT_DTYPE>(   \
+  constant INT_DTYPE & n             [[buffer(0)]],       \
+  constant DTYPE     * col           [[buffer(1)]],       \
+  constant DTYPE     * offset_ptr    [[buffer(2)]],       \
+  constant DTYPE     * mask_ptr      [[buffer(3)]],       \
+  constant INT_DTYPE & channels      [[buffer(4)]],       \
+  constant INT_DTYPE & height        [[buffer(5)]],       \
+  constant INT_DTYPE & width         [[buffer(6)]],       \
+  constant INT_DTYPE & kernel_h      [[buffer(7)]],       \
+  constant INT_DTYPE & kernel_w      [[buffer(8)]],       \
+  constant INT_DTYPE & pad_h         [[buffer(9)]],       \
+  constant INT_DTYPE & pad_w         [[buffer(10)]],      \
+  constant INT_DTYPE & stride_h      [[buffer(11)]],      \
+  constant INT_DTYPE & stride_w      [[buffer(12)]],      \
+  constant INT_DTYPE & dilation_h    [[buffer(13)]],      \
+  constant INT_DTYPE & dilation_w    [[buffer(14)]],      \
+  constant INT_DTYPE & batch_sz      [[buffer(15)]],      \
+  constant INT_DTYPE & n_offset_grps [[buffer(16)]],      \
+  constant INT_DTYPE & out_h         [[buffer(17)]],      \
+  constant INT_DTYPE & out_w         [[buffer(18)]],      \
+  constant bool      & use_mask      [[buffer(19)]],      \
+  device   DTYPE     * grad_im       [[buffer(20)]],      \
+  uint2     tgid   [[threadgroup_position_in_grid]],      \
+  uint2     tptg   [[threads_per_threadgroup]],           \
+  uint2     tid2   [[thread_position_in_threadgroup]]);
+
+template <typename T, typename integer_t>
+kernel void deformable_col2im_coord_kernel(
+    constant integer_t & n               [[buffer(0)]],
+    constant T         * col_ptr         [[buffer(1)]],
+    constant T         * im_ptr          [[buffer(2)]],
+    constant T         * offset_ptr      [[buffer(3)]],
+    constant T         * mask_ptr        [[buffer(4)]],
+    constant integer_t & channels        [[buffer(5)]],
+    constant integer_t & height          [[buffer(6)]],
+    constant integer_t & width           [[buffer(7)]],
+    constant integer_t & weight_h        [[buffer(8)]],
+    constant integer_t & weight_w        [[buffer(9)]],
+    constant integer_t & pad_h           [[buffer(10)]],
+    constant integer_t & pad_w           [[buffer(11)]],
+    constant integer_t & stride_h        [[buffer(12)]],
+    constant integer_t & stride_w        [[buffer(13)]],
+    constant integer_t & dilation_h      [[buffer(14)]],
+    constant integer_t & dilation_w      [[buffer(15)]],
+    constant integer_t & batch_sz        [[buffer(16)]],
+    constant integer_t & offset_channels [[buffer(17)]],
+    constant integer_t & n_offset_grps   [[buffer(18)]],
+    constant integer_t & out_h           [[buffer(19)]],
+    constant integer_t & out_w           [[buffer(20)]],
+    constant bool      & use_mask        [[buffer(21)]],
+    device   T         * grad_offset     [[buffer(22)]],
+    device   T         * grad_mask       [[buffer(23)]],
+    uint2     tgid   [[threadgroup_position_in_grid]],
+    uint2     tptg   [[threads_per_threadgroup]],
+    uint2     tid2   [[thread_position_in_threadgroup]]){
+  MPS_1D_KERNEL_LOOP_T(index, n, 1, integer_t) {
+    T grad_offset_val = 0;
+    T grad_mask_val = 0;
+
+    integer_t w = index % out_w;
+    integer_t h = (index / out_w) % out_h;
+    integer_t w_w = (index / (out_w * out_h * 2)) % weight_w;
+    integer_t w_h = (index / (out_w * out_h * 2 * weight_w)) % weight_h;
+    integer_t c = (index / (out_w * out_h)) % offset_channels;
+    integer_t b = index / (out_w * out_h * offset_channels);
+
+    const integer_t offset_grp = c / (2 * weight_h * weight_w);
+    const integer_t col_step = weight_h * weight_w;
+
+    integer_t c_per_offset_grp = channels / n_offset_grps;
+
+    col_ptr += offset_grp * c_per_offset_grp * weight_h * weight_w * batch_sz *
+        out_w * out_h;
+    im_ptr +=
+        (b * n_offset_grps + offset_grp) * c_per_offset_grp * height * width;
+    offset_ptr += (b * n_offset_grps + offset_grp) * 2 * weight_h * weight_w *
+        out_h * out_w;
+
+    if (use_mask) {
+      mask_ptr += (b * n_offset_grps + offset_grp) * weight_h * weight_w *
+          out_h * out_w;
+    }
+
+    const integer_t offset_c = c - offset_grp * 2 * weight_h * weight_w;
+    const bool is_y_direction = offset_c % 2 == 0;
+
+    const integer_t c_bound = c_per_offset_grp * weight_h * weight_w;
+    for (integer_t col_c = (offset_c / 2); col_c < c_bound; col_c += col_step) {
+      const integer_t col_pos =
+          (((col_c * batch_sz + b) * out_h) + h) * out_w + w;
+
+      integer_t out_x = col_pos % out_w;
+      integer_t out_y = (col_pos / out_w) % out_h;
+      integer_t j = (col_pos / (out_w * out_h * batch_sz)) % weight_w;
+      integer_t i = (col_pos / (out_w * out_h * batch_sz * weight_w)) % weight_h;
+
+      const integer_t mask_idx = i * weight_w + j;
+
+      const integer_t offset_h_ptr =
+          (((2 * mask_idx) * out_h + out_y) * out_w + out_x);
+      const integer_t offset_w_ptr =
+          (((2 * mask_idx + 1) * out_h + out_y) * out_w + out_x);
+      const T offset_h = offset_ptr[offset_h_ptr];
+      const T offset_w = offset_ptr[offset_w_ptr];
+
+      T mask_value = 1;
+      if (use_mask) {
+        mask_value = mask_ptr[(mask_idx * out_h + out_y) * out_w + out_x];
+      }
+
+      T y = (out_y * stride_h - pad_h) + i * dilation_h + offset_h;
+      T x = (out_x * stride_w - pad_w) + j * dilation_w + offset_w;
+
+      const T weight =
+          get_coordinate_weight(im_ptr, height, width, y, x, is_y_direction);
+      grad_offset_val += mask_value * weight * col_ptr[col_pos];
+
+      if (use_mask && is_y_direction) {
+        grad_mask_val += col_ptr[col_pos] *
+            bilinear_interpolate(im_ptr, height, width, y, x, index);
+      }
+
+      im_ptr += height * width;
+    }
+
+    grad_offset[index] = grad_offset_val;
+
+    if (use_mask && is_y_direction) {
+      const integer_t idx =
+          ((((b * n_offset_grps + offset_grp) * weight_h + w_h) * weight_w +
+            w_w) *
+               out_h +
+           h) *
+              out_w +
+          w;
+      grad_mask[idx] = grad_mask_val;
+    }
+  } // MPS_1D_KERNEL_LOOP_T
+}
+
+#define REGISTER_DEFORMABLE_COL2IM_COORD_OP(DTYPE, INT_DTYPE) \
+template                                                      \
+[[host_name("deformable_col2im_coord_" #DTYPE)]]              \
+kernel void deformable_col2im_coord_kernel<DTYPE, INT_DTYPE>( \
+  constant INT_DTYPE & n               [[buffer(0)]],         \
+  constant DTYPE     * col_ptr         [[buffer(1)]],         \
+  constant DTYPE     * im_ptr          [[buffer(2)]],         \
+  constant DTYPE     * offset_ptr      [[buffer(3)]],         \
+  constant DTYPE     * mask_ptr        [[buffer(4)]],         \
+  constant INT_DTYPE & channels        [[buffer(5)]],         \
+  constant INT_DTYPE & height          [[buffer(6)]],         \
+  constant INT_DTYPE & width           [[buffer(7)]],         \
+  constant INT_DTYPE & weight_h        [[buffer(8)]],         \
+  constant INT_DTYPE & weight_w        [[buffer(9)]],         \
+  constant INT_DTYPE & pad_h           [[buffer(10)]],        \
+  constant INT_DTYPE & pad_w           [[buffer(11)]],        \
+  constant INT_DTYPE & stride_h        [[buffer(12)]],        \
+  constant INT_DTYPE & stride_w        [[buffer(13)]],        \
+  constant INT_DTYPE & dilation_h      [[buffer(14)]],        \
+  constant INT_DTYPE & dilation_w      [[buffer(15)]],        \
+  constant INT_DTYPE & batch_sz        [[buffer(16)]],        \
+  constant INT_DTYPE & offset_channels [[buffer(17)]],        \
+  constant INT_DTYPE & n_offset_grps   [[buffer(18)]],        \
+  constant INT_DTYPE & out_h           [[buffer(19)]],        \
+  constant INT_DTYPE & out_w           [[buffer(20)]],        \
+  constant bool      & use_mask        [[buffer(21)]],        \
+  device   DTYPE     * grad_offset     [[buffer(22)]],        \
+  device   DTYPE     * grad_mask       [[buffer(23)]],        \
+  uint2     tgid   [[threadgroup_position_in_grid]],          \
+  uint2     tptg   [[threads_per_threadgroup]],               \
+  uint2     tid2   [[thread_position_in_threadgroup]]);
 
 REGISTER_NMS_OP(float);
 REGISTER_NMS_OP(half);
@@ -1060,6 +1456,12 @@ REGISTER_PS_ROI_POOL_OP(float, int64_t);
 REGISTER_PS_ROI_POOL_OP(half, int64_t);
 REGISTER_PS_ROI_POOL_BACKWARD_OP(float, int64_t);
 REGISTER_PS_ROI_POOL_BACKWARD_OP(half, int64_t);
+REGISTER_DEFORMABLE_IM2COL_OP(float, int64_t);
+REGISTER_DEFORMABLE_IM2COL_OP(half, int64_t);
+REGISTER_DEFORMABLE_COL2IM_OP(float, int64_t);
+REGISTER_DEFORMABLE_COL2IM_OP(half, int64_t);
+REGISTER_DEFORMABLE_COL2IM_COORD_OP(float, int64_t);
+REGISTER_DEFORMABLE_COL2IM_COORD_OP(half, int64_t);
 
 )VISION_METAL";
 
