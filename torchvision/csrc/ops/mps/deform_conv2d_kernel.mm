@@ -140,8 +140,8 @@ void deformable_im2col(
 
       // this function call is a no-op if MPS Profiler is not enabled
       getMPSProfiler().beginProfileKernel(visionPSO, 
-          /*Kernel Name*/ kernel, 
-          /*Tensorlist*/{input_, data_offset_, data_mask_});
+          kernel, 
+          {input_, data_offset_, data_mask_});
 
       [computeEncoder setComputePipelineState:visionPSO];
 
@@ -256,8 +256,8 @@ void compute_grad_input(
 
       // this function call is a no-op if MPS Profiler is not enabled
       getMPSProfiler().beginProfileKernel(visionPSO, 
-          /*Kernel Name*/ kernel, 
-          /*Tensorlist*/{columns_, offset_, mask_});
+          kernel, 
+          {columns_, offset_, mask_});
 
       [computeEncoder setComputePipelineState:visionPSO];
 
@@ -368,8 +368,8 @@ void compute_grad_offset_and_mask(
 
       // this function call is a no-op if MPS Profiler is not enabled
       getMPSProfiler().beginProfileKernel(visionPSO, 
-          /*Kernel Name*/ kernel, 
-          /*Tensorlist*/{columns_, input_, offset_, mask_});
+          kernel, 
+          {columns_, input_, offset_, mask_});
 
       [computeEncoder setComputePipelineState:visionPSO];
 
