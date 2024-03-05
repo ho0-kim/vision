@@ -67,10 +67,17 @@
 // https://github.com/open-mmlab/mmdetection/blob/master/mmdet/ops/dcn/src/deform_conv_cuda.cpp
 
 #include <ATen/ATen.h>
+#include <torch/library.h>
 #include <ATen/mps/MPSProfiler.h>
 #include <ATen/native/mps/OperationUtils.h>
+#include <ATen/mps/MPSGuardImpl.h>
 #include "mps_helpers.h"
 #include "mps_kernels.h"
+
+#include <ATen/ops/addmm.h>
+
+#include "ATen/core/Formatting.h"
+#include <iostream>
 
 namespace vision {
 namespace ops {
@@ -101,6 +108,7 @@ void deformable_im2col(
     bool use_mask,
     at::Tensor data_col) {
   using namespace at::native::mps;
+  at::mps::OptionalMPSGuard device_guard(input.get_device());
 
   const int64_t num_kernels =
       (int64_t)n_in_channels * out_h * out_w * parallel_imgs;
@@ -212,6 +220,7 @@ void compute_grad_input(
     bool use_mask,
     at::Tensor grad_im) {
   using namespace at::native::mps;
+  at::mps::OptionalMPSGuard device_guard(columns.get_device());
 
   const int out_h =
       (height + 2 * pad_h - (dilation_h * (weight_h - 1) + 1)) / stride_h + 1;
@@ -220,6 +229,8 @@ void compute_grad_input(
 
   const int64_t num_kernels =
       (int64_t)channels * weight_h * weight_w * out_h * out_w * parallel_imgs;
+
+	at::globalContext().alertNotDeterministic("compute_grad_input");
 
   auto columns_ = columns.contiguous();
   auto offset_ = offset.contiguous();
@@ -321,6 +332,7 @@ void compute_grad_offset_and_mask(
     at::Tensor grad_offset,
     at::Tensor grad_mask) {
   using namespace at::native::mps;
+  at::mps::OptionalMPSGuard device_guard(columns.get_device());
 
   const int out_h =
       (height + 2 * pad_h - (dilation_h * (weight_h - 1) + 1)) / stride_h + 1;
@@ -349,7 +361,7 @@ void compute_grad_offset_and_mask(
   int64_t n_offset_grps_ = (int64_t)n_offset_grps;
   int64_t out_h_ = (int64_t)out_h;
   int64_t out_w_ = (int64_t)out_w;
-  const int64_t offset_channles = (int64_t)2 * weight_h * weight_w * n_offset_grps;
+  const int64_t offset_channles = (int64_t)2 * weight_h_ * weight_w_ * n_offset_grps_;
   
   id<MTLBuffer> columnBuffer = getMTLBufferStorage(columns_);
   id<MTLBuffer> inputBuffer = getMTLBufferStorage(input_);
@@ -517,8 +529,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> backward_gradient_inputs(
     columns.zero_();
     // Separate into weight groups
     for (int g = 0; g < n_weight_grps; g++) {
-      columns[g] = columns[g].addmm_(
-          weight[g].flatten(1).transpose(0, 1), grad_out[elt][g].flatten(1));
+			columns[g] = at::addmm(columns[g],
+					weight[g].flatten(1).transpose(0, 1),
+					grad_out[elt][g].flatten(1));
     }
 
     compute_grad_offset_and_mask(
@@ -680,12 +693,10 @@ at::Tensor backward_gradient_parameters(
         columns);
 
     for (int g = 0; g < n_weight_grps; g++) {
-      grad_weight[g] =
-          grad_weight[g]
-              .flatten(1)
-              .addmm_(
-                  grad_out_buf[elt][g].flatten(1), columns[g].transpose(1, 0))
-              .view_as(grad_weight[g]);
+			grad_weight[g] = at::addmm(grad_weight[g].flatten(1),
+					grad_out_buf[elt][g].flatten(1),
+					columns[g].transpose(1, 0))
+				.view_as(grad_weight[g]);
     }
   }
 
@@ -893,13 +904,14 @@ at::Tensor deform_conv2d_forward_kernel(
         n_offset_grps,
         use_mask,
         columns);
+		
     columns = columns.view(
         {n_weight_grps, columns.size(0) / n_weight_grps, columns.size(1)});
     for (int g = 0; g < n_weight_grps; g++) {
-      out_buf[b][g] = out_buf[b][g]
-                          .flatten(1)
-                          .addmm_(weight_c[g].flatten(1), columns[g])
-                          .view_as(out_buf[b][g]);
+			out_buf[b][g] = at::addmm(out_buf[b][g].flatten(1), 
+					weight_c[g].flatten(1), 
+					columns[g])
+				.view_as(out_buf[b][g]);
     }
     columns =
         columns.view({columns.size(0) * columns.size(1), columns.size(2)});

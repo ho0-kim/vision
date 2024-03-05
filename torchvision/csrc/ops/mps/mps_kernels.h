@@ -123,6 +123,50 @@ inline T bilinear_interpolate(
 }
 
 template <typename T, typename integer_t>
+inline T bilinear_interpolate_dcn(
+    constant T* input,
+    integer_t height,
+    integer_t width,
+    T y,
+    T x,
+    uint index /* index for debug only*/) {
+  // deal with cases that inverse elements are out of feature map boundary
+  if (y <= -1.0 || y >= height || x <= -1.0 || x >= width) {
+    // empty
+    return 0;
+  }
+
+  integer_t y_low = (integer_t)floor(y);
+  integer_t x_low = (integer_t)floor(x);
+  integer_t y_high = y_low + 1;
+  integer_t x_high = x_low + 1;
+
+  T ly = y - y_low;
+  T lx = x - x_low;
+  T hy = 1. - ly, hx = 1. - lx;
+
+  // do bilinear interpolation
+  T v1 = 0;
+  if (y_low >= 0 && x_low >= 0)
+    v1 = input[y_low * width + x_low];
+  T v2 = 0;
+  if (y_low >= 0 && x_high <= width - 1)
+    v2 = input[y_low * width + x_high];
+  T v3 = 0;
+  if (y_high <= height - 1 && x_low >= 0)
+    v3 = input[y_high * width + x_low];
+  T v4 = 0;
+  if (y_high <= height - 1 && x_high <= width - 1)
+    v4 = input[y_high * width + x_high];
+  
+  T w1 = hy * hx, w2 = hy * lx, w3 = ly * hx, w4 = ly * lx;
+
+  T val = (w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4);
+
+  return val;
+}
+
+template <typename T, typename integer_t>
 inline void bilinear_interpolate_gradient(
     integer_t height,
     integer_t width,
@@ -207,8 +251,8 @@ inline T get_coordinate_weight(
     T y,
     T x,
     bool is_y_direction) {
-  integer_t y_l = floor(y);
-  integer_t x_l = floor(x);
+  integer_t y_l = (integer_t)floor(y);
+  integer_t x_l = (integer_t)floor(x);
   integer_t y_h = y_l + 1;
   integer_t x_h = x_l + 1;
 
@@ -225,10 +269,10 @@ inline T get_coordinate_weight(
 
   if (is_y_direction) {
     T dx = x - x_l;
-    return dx * (v_YX - v_yX) + (1 - dx) * (v_Yx - v_yx);
+    return dx * (v_YX - v_yX) + (1. - dx) * (v_Yx - v_yx);
   } else {
     T dy = y - y_l;
-    return dy * (v_YX - v_Yx) + (1 - dy) * (v_yX - v_yx);
+    return dy * (v_YX - v_Yx) + (1. - dy) * (v_yX - v_yx);
   }
 }
 
@@ -1101,7 +1145,7 @@ kernel void deformable_im2col_kernel(
     uint2     tgid   [[threadgroup_position_in_grid]],
     uint2     tptg   [[threads_per_threadgroup]],
     uint2     tid2   [[thread_position_in_threadgroup]]){
-  MPS_1D_KERNEL_LOOP_T(index, n, 1, integer_t) {
+  MPS_1D_KERNEL_LOOP_T(index, n, batch_sz, integer_t) {
     const integer_t out_x = index % out_w;
     const integer_t out_y = (index / out_w) % out_h;
     const integer_t out_b = (index / (out_w * out_h)) % batch_sz;
@@ -1141,12 +1185,12 @@ kernel void deformable_im2col_kernel(
             offset_ptr[offset_idx * (out_h * out_w) + out_y * out_w + out_x];
         const T offset_w = offset_ptr
             [(offset_idx + 1) * (out_h * out_w) + out_y * out_w + out_x];
-        const T y = static_cast<T>(
-            (out_y * stride_h - pad_h) + i * dilation_h + offset_h);
-        const T x = static_cast<T>(
-            (out_x * stride_w - pad_w) + j * dilation_w + offset_w);
+        const T y =
+            (out_y * stride_h - pad_h) + i * dilation_h + offset_h;
+        const T x =
+            (out_x * stride_w - pad_w) + j * dilation_w + offset_w;
         *columns_ptr =
-            mask_value * bilinear_interpolate(input_ptr, height, width, y, x, index);
+            mask_value * bilinear_interpolate_dcn(input_ptr, height, width, y, x, index);
         columns_ptr += batch_sz * out_h * out_w;
       }
     }
@@ -1210,7 +1254,7 @@ kernel void deformable_col2im_kernel(
     uint2     tid2   [[thread_position_in_threadgroup]]){
   const integer_t grad_im_numel = width * height * channels * batch_sz;
 
-  MPS_1D_KERNEL_LOOP_T(index, n, 1, integer_t) {
+  MPS_1D_KERNEL_LOOP_T(index, n, batch_sz, integer_t) {
     const integer_t out_x = index % out_w;
     const integer_t out_y = (index / out_w) % out_h;
     const integer_t b = (index / (out_w * out_h)) % batch_sz;
@@ -1253,9 +1297,9 @@ kernel void deformable_col2im_kernel(
         integer_t yp = (integer_t)y + dy;
         integer_t xp = (integer_t)x + dx;
         if (0 <= yp && yp < height && 0 <= xp && xp < width &&
-            abs(y - yp) < 1 && abs(x - xp) < 1) {// include metal_math.h ??
+            abs(y - yp) < 1. && abs(x - xp) < 1.) {
           integer_t grad_pos = ((b * channels + c) * height + yp) * width + xp;
-          T weight = (1 - abs(y - yp)) * (1 - abs(x - xp));// include metal_math.h ??
+          T weight = (1 - abs(y - yp)) * (1 - abs(x - xp));
           atomic_add_float(grad_im + grad_pos, mask_value * weight * col[index]);
         }
       }
@@ -1321,7 +1365,7 @@ kernel void deformable_col2im_coord_kernel(
     uint2     tgid   [[threadgroup_position_in_grid]],
     uint2     tptg   [[threads_per_threadgroup]],
     uint2     tid2   [[thread_position_in_threadgroup]]){
-  MPS_1D_KERNEL_LOOP_T(index, n, 1, integer_t) {
+  MPS_1D_KERNEL_LOOP_T(index, n, batch_sz, integer_t) {
     T grad_offset_val = 0;
     T grad_mask_val = 0;
 
@@ -1385,7 +1429,7 @@ kernel void deformable_col2im_coord_kernel(
 
       if (use_mask && is_y_direction) {
         grad_mask_val += col_ptr[col_pos] *
-            bilinear_interpolate(im_ptr, height, width, y, x, index);
+            bilinear_interpolate_dcn(im_ptr, height, width, y, x, index);
       }
 
       im_ptr += height * width;
