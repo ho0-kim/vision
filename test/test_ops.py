@@ -923,6 +923,9 @@ optests.generate_opcheck_tests(
 
 class TestDeformConv:
     dtype = torch.float64
+    mps_dtype = torch.float32
+    mps_tol = 1e-5
+    mps_backward_tol = 5e-2
 
     def expected_fn(self, x, weight, offset, mask, bias, stride=1, padding=0, dilation=1):
         stride_h, stride_w = _pair(stride)
@@ -1035,7 +1038,7 @@ class TestDeformConv:
         )
         return DeformConvModuleWrapper(obj) if wrap else obj
 
-    @pytest.mark.parametrize("device", cpu_and_cuda())
+    @pytest.mark.parametrize("device", cpu_and_cuda_and_mps())
     def test_is_leaf_node(self, device):
         op_obj = self.make_obj(wrap=True).to(device=device)
         graph_node_names = get_graph_node_names(op_obj)
@@ -1044,18 +1047,25 @@ class TestDeformConv:
         assert len(graph_node_names[0]) == len(graph_node_names[1])
         assert len(graph_node_names[0]) == 1 + op_obj.n_inputs
 
-    @pytest.mark.parametrize("device", cpu_and_cuda())
+    @pytest.mark.parametrize("device", cpu_and_cuda_and_mps())
     @pytest.mark.parametrize("contiguous", (True, False))
     @pytest.mark.parametrize("batch_sz", (0, 33))
     @pytest.mark.opcheck_only_one()
     def test_forward(self, device, contiguous, batch_sz, dtype=None):
-        dtype = dtype or self.dtype
+        dtype = self.mps_dtype if device == "mps" else dtype or self.dtype
         x, _, offset, mask, _, stride, padding, dilation = self.get_fn_args(device, contiguous, batch_sz, dtype)
         in_channels = 6
         out_channels = 2
         kernel_size = (3, 2)
         groups = 2
-        tol = 2e-3 if dtype is torch.half else 1e-5
+        tol = 1e-5
+        if dtype is torch.half:
+            if device == "mps":
+                tol = 3e-3
+            else:
+                tol = 2e-3
+        elif device == "mps":
+            tol = self.mps_tol
 
         layer = self.make_obj(in_channels, out_channels, kernel_size, groups, wrap=False).to(
             device=x.device, dtype=dtype
@@ -1097,28 +1107,31 @@ class TestDeformConv:
             wrong_mask = torch.rand_like(mask[:, :2])
             layer(x, offset, wrong_mask)
 
-    @pytest.mark.parametrize("device", cpu_and_cuda())
+    @pytest.mark.parametrize("device", cpu_and_cuda_and_mps())
     @pytest.mark.parametrize("contiguous", (True, False))
     @pytest.mark.parametrize("batch_sz", (0, 33))
     @pytest.mark.opcheck_only_one()
     def test_backward(self, device, contiguous, batch_sz):
+        dtype = self.mps_dtype if device == "mps" else self.dtype
+        nondet_tol = self.mps_backward_tol if device == "mps" else 1e-5
         x, weight, offset, mask, bias, stride, padding, dilation = self.get_fn_args(
-            device, contiguous, batch_sz, self.dtype
+            device, contiguous, batch_sz, dtype
         )
+        print("x.size():", x.size())
 
         def func(x_, offset_, mask_, weight_, bias_):
             return ops.deform_conv2d(
                 x_, offset_, weight_, bias_, stride=stride, padding=padding, dilation=dilation, mask=mask_
             )
 
-        gradcheck(func, (x, offset, mask, weight, bias), nondet_tol=1e-5, fast_mode=True)
+        gradcheck(func, (x, offset, mask, weight, bias), nondet_tol=nondet_tol, fast_mode=True)
 
         def func_no_mask(x_, offset_, weight_, bias_):
             return ops.deform_conv2d(
                 x_, offset_, weight_, bias_, stride=stride, padding=padding, dilation=dilation, mask=None
             )
 
-        gradcheck(func_no_mask, (x, offset, weight, bias), nondet_tol=1e-5, fast_mode=True)
+        gradcheck(func_no_mask, (x, offset, weight, bias), nondet_tol=nondet_tol, fast_mode=True)
 
         @torch.jit.script
         def script_func(x_, offset_, mask_, weight_, bias_, stride_, pad_, dilation_):
@@ -1130,7 +1143,7 @@ class TestDeformConv:
         gradcheck(
             lambda z, off, msk, wei, bi: script_func(z, off, msk, wei, bi, stride, padding, dilation),
             (x, offset, mask, weight, bias),
-            nondet_tol=1e-5,
+            nondet_tol=nondet_tol,
             fast_mode=True,
         )
 
@@ -1144,7 +1157,7 @@ class TestDeformConv:
         gradcheck(
             lambda z, off, wei, bi: script_func_no_mask(z, off, wei, bi, stride, padding, dilation),
             (x, offset, weight, bias),
-            nondet_tol=1e-5,
+            nondet_tol=nondet_tol,
             fast_mode=True,
         )
 
