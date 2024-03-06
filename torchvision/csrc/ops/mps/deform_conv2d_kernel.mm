@@ -74,11 +74,6 @@
 #include "mps_helpers.h"
 #include "mps_kernels.h"
 
-#include <ATen/ops/addmm.h>
-
-#include "ATen/core/Formatting.h"
-#include <iostream>
-
 namespace vision {
 namespace ops {
 
@@ -529,9 +524,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> backward_gradient_inputs(
     columns.zero_();
     // Separate into weight groups
     for (int g = 0; g < n_weight_grps; g++) {
-			columns[g] = at::addmm(columns[g],
-					weight[g].flatten(1).transpose(0, 1),
-					grad_out[elt][g].flatten(1));
+			columns[g] = columns[g].addmm(
+          weight[g].flatten(1).transpose(0, 1), grad_out[elt][g].flatten(1));
     }
 
     compute_grad_offset_and_mask(
@@ -693,10 +687,12 @@ at::Tensor backward_gradient_parameters(
         columns);
 
     for (int g = 0; g < n_weight_grps; g++) {
-			grad_weight[g] = at::addmm(grad_weight[g].flatten(1),
-					grad_out_buf[elt][g].flatten(1),
-					columns[g].transpose(1, 0))
-				.view_as(grad_weight[g]);
+			grad_weight[g] =
+          grad_weight[g]
+              .flatten(1)
+              .addmm(
+                  grad_out_buf[elt][g].flatten(1), columns[g].transpose(1, 0))
+              .view_as(grad_weight[g]);
     }
   }
 
@@ -908,10 +904,10 @@ at::Tensor deform_conv2d_forward_kernel(
     columns = columns.view(
         {n_weight_grps, columns.size(0) / n_weight_grps, columns.size(1)});
     for (int g = 0; g < n_weight_grps; g++) {
-			out_buf[b][g] = at::addmm(out_buf[b][g].flatten(1), 
-					weight_c[g].flatten(1), 
-					columns[g])
-				.view_as(out_buf[b][g]);
+			out_buf[b][g] = out_buf[b][g]
+                          .flatten(1)
+                          .addmm(weight_c[g].flatten(1), columns[g])
+                          .view_as(out_buf[b][g]);
     }
     columns =
         columns.view({columns.size(0) * columns.size(1), columns.size(2)});
